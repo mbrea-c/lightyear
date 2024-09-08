@@ -45,7 +45,20 @@ pub struct Rollback {
 pub struct RollbackEvent<C> {
     /// Entity that triggered the rollback
     pub entity: Entity,
+    pub reason: RollbackReason,
     phantom_data: PhantomData<C>,
+}
+
+#[derive(Reflect, Debug, Clone, Copy)]
+pub enum RollbackReason {
+    /// Confirmed entity was deleted but predicted entity was not
+    DidNotDelete,
+    /// Confirmed entity and prediction history both exist, but values don't match
+    MismatchedValues,
+    /// Confirmed exists, but predicted history missing
+    MissingHistory,
+    /// Confirmed exists, history exists but indicates predicted component was removed
+    DeletedEarly,
 }
 
 /// Resource that will track whether we should do rollback or not
@@ -193,18 +206,30 @@ pub(crate) fn check_rollback<C: SyncComponent>(
             let should_rollback = match confirmed_component {
                 // TODO: history-value should not be empty here; should we panic if it is?
                 // confirm does not exist. rollback if history value is not Removed
-                None => history_value.map_or(false, |history_value| {
-                    history_value != ComponentState::Removed
+                None => history_value.map_or(None, |history_value| {
+                    if history_value == ComponentState::Removed {
+                        None
+                    } else {
+                        Some(RollbackReason::DidNotDelete)
+                    }
                 }),
                 // confirm exist. rollback if history value is different
-                Some(c) => history_value.map_or(true, |history_value| match history_value {
-                    ComponentState::Updated(history_value) => {
-                        component_registry.should_rollback(&history_value, c)
-                    }
-                    ComponentState::Removed => true,
-                }),
+                Some(c) => {
+                    history_value.map_or(Some(RollbackReason::MissingHistory), |history_value| {
+                        match history_value {
+                            ComponentState::Updated(history_value) => {
+                                if component_registry.should_rollback(&history_value, c) {
+                                    Some(RollbackReason::MismatchedValues)
+                                } else {
+                                    None
+                                }
+                            }
+                            ComponentState::Removed => Some(RollbackReason::DeletedEarly),
+                        }
+                    })
+                }
             };
-            if should_rollback {
+            if let Some(reason) = should_rollback {
                 debug!(
                    ?predicted_exist, ?confirmed_exist,
                    "Rollback check: mismatch for component between predicted and confirmed {:?} on tick {:?} for component {:?}. Current tick: {:?}",
@@ -216,6 +241,7 @@ pub(crate) fn check_rollback<C: SyncComponent>(
 
                 evw_rollback.send(RollbackEvent {
                     entity: confirmed_entity,
+                    reason,
                     phantom_data: PhantomData,
                 });
             }

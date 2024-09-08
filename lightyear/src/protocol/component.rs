@@ -1,15 +1,19 @@
+use bevy::app::{FixedPreUpdate, Plugin};
 use bevy::ecs::component::ComponentId;
 use bevy::ecs::entity::MapEntities;
-use std::any::TypeId;
+use std::any::{type_name, TypeId};
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::ops::{Add, Mul};
 
-use bevy::prelude::{App, Component, EntityWorldMut, Mut, Resource, TypePath, World};
+use bevy::prelude::{
+    App, Component, Entity, EntityWorldMut, EventReader, Mut, ResMut, Resource, TypePath, World,
+};
 use bevy::ptr::Ptr;
 use bevy::utils::HashMap;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use tracing::{debug, error, trace};
 
@@ -19,7 +23,7 @@ use crate::client::interpolation::{add_interpolation_systems, add_prepare_interp
 use crate::client::prediction::plugin::{
     add_non_networked_rollback_systems, add_prediction_systems, add_resource_rollback_systems,
 };
-use crate::client::prediction::rollback::RollbackEvent;
+use crate::client::prediction::rollback::{RollbackEvent, RollbackReason};
 use crate::prelude::client::SyncComponent;
 use crate::prelude::server::ServerConfig;
 use crate::prelude::{ChannelDirection, Message, Tick};
@@ -858,6 +862,81 @@ mod delta {
     }
 }
 
+#[derive(Resource, Clone, Serialize, Deserialize, Default)]
+pub struct AggregatedRollbackCauses {
+    per_entity_component: HashMap<(Entity, String), Rollbacks>,
+    per_entity: HashMap<Entity, Rollbacks>,
+    per_component: HashMap<String, Rollbacks>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct Rollbacks {
+    /// Confirmed entity was deleted but predicted entity was not
+    did_not_delete: u32,
+    /// Confirmed entity and prediction history both exist, but values don't match
+    mismatched_values: u32,
+    /// Confirmed exists, but predicted history missing
+    missing_history: u32,
+    /// Confirmed exists, history exists but indicates predicted component was removed
+    deleted_early: u32,
+}
+
+impl Rollbacks {
+    pub fn increment_by_reason(&mut self, reason: RollbackReason) {
+        match reason {
+            RollbackReason::DidNotDelete => self.did_not_delete += 1,
+            RollbackReason::MismatchedValues => self.mismatched_values += 1,
+            RollbackReason::MissingHistory => self.missing_history += 1,
+            RollbackReason::DeletedEarly => self.deleted_early += 1,
+        };
+    }
+}
+
+impl AggregatedRollbackCauses {
+    pub fn new_rollback<C>(&mut self, ev: &RollbackEvent<C>) {
+        let name = type_name::<C>().to_string();
+
+        let mut val = self.per_entity.get(&ev.entity).cloned().unwrap_or_default();
+        val.increment_by_reason(ev.reason);
+        self.per_entity.insert(ev.entity, val);
+
+        let mut val = self.per_component.get(&name).cloned().unwrap_or_default();
+        val.increment_by_reason(ev.reason);
+        self.per_component.insert(name.clone(), val);
+
+        let mut val = self
+            .per_entity_component
+            .get(&(ev.entity, name.clone()))
+            .cloned()
+            .unwrap_or_default();
+        val.increment_by_reason(ev.reason);
+        self.per_entity_component
+            .insert((ev.entity, name.clone()), val);
+    }
+}
+
+#[derive(Default)]
+pub struct RollbackAggregatorPlugin<C: Component> {
+    __phantom_data: PhantomData<C>,
+}
+
+impl<C: Component> Plugin for RollbackAggregatorPlugin<C> {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<AggregatedRollbackCauses>();
+        app.add_systems(FixedPreUpdate, aggregate_rollbacks::<C>);
+        app.add_event::<RollbackEvent<C>>();
+    }
+}
+
+pub fn aggregate_rollbacks<C: Component>(
+    mut causes: ResMut<AggregatedRollbackCauses>,
+    mut evr_rollback_event: EventReader<RollbackEvent<C>>,
+) {
+    for ev in evr_rollback_event.read() {
+        causes.new_rollback::<C>(ev);
+    }
+}
+
 fn register_component_send<C: Component>(app: &mut App, direction: ChannelDirection) {
     let is_client = app.world().get_resource::<ClientConfig>().is_some();
     let is_server = app.world().get_resource::<ServerConfig>().is_some();
@@ -873,7 +952,11 @@ fn register_component_send<C: Component>(app: &mut App, direction: ChannelDirect
                 );
                 crate::server::events::emit_replication_events::<C>(app);
             }
-            app.add_event::<RollbackEvent<C>>();
+            if !app.is_plugin_added::<RollbackAggregatorPlugin<C>>() {
+                app.add_plugins(RollbackAggregatorPlugin::<C> {
+                    __phantom_data: PhantomData::default(),
+                });
+            }
         }
         ChannelDirection::ServerToClient => {
             if is_server {
@@ -886,7 +969,11 @@ fn register_component_send<C: Component>(app: &mut App, direction: ChannelDirect
                 );
                 crate::client::events::emit_replication_events::<C>(app);
             }
-            app.add_event::<RollbackEvent<C>>();
+            if !app.is_plugin_added::<RollbackAggregatorPlugin<C>>() {
+                app.add_plugins(RollbackAggregatorPlugin::<C> {
+                    __phantom_data: PhantomData::default(),
+                });
+            }
         }
         ChannelDirection::Bidirectional => {
             register_component_send::<C>(app, ChannelDirection::ServerToClient);
