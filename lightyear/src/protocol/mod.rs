@@ -24,6 +24,9 @@ pub(crate) mod delta;
 pub(crate) mod registry;
 pub(crate) mod serialize;
 
+pub use component::AggregatedRollbackCauses;
+pub use component::Rollbacks;
+
 /// Data that can be used in an Event
 /// Same as `Event`, but we implement it automatically for all compatible types
 pub trait EventContext: Send + Sync + 'static {}

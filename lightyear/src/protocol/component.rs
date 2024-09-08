@@ -864,21 +864,21 @@ mod delta {
 
 #[derive(Resource, Clone, Serialize, Deserialize, Default)]
 pub struct AggregatedRollbackCauses {
-    per_entity_component: HashMap<(Entity, String), Rollbacks>,
-    per_entity: HashMap<Entity, Rollbacks>,
-    per_component: HashMap<String, Rollbacks>,
+    pub per_entity_component: HashMap<(Entity, String), Rollbacks>,
+    pub per_entity: HashMap<Entity, Rollbacks>,
+    pub per_component: HashMap<String, Rollbacks>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct Rollbacks {
     /// Confirmed entity was deleted but predicted entity was not
-    did_not_delete: u32,
+    pub did_not_delete: u32,
     /// Confirmed entity and prediction history both exist, but values don't match
-    mismatched_values: u32,
+    pub mismatched_values: u32,
     /// Confirmed exists, but predicted history missing
-    missing_history: u32,
+    pub missing_history: u32,
     /// Confirmed exists, history exists but indicates predicted component was removed
-    deleted_early: u32,
+    pub deleted_early: u32,
 }
 
 impl Rollbacks {
